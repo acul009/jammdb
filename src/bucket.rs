@@ -1120,14 +1120,14 @@ mod tests {
     }
 
     bucket_errors! {
-        double_create_bucket: (true, |b: &Bucket| {
+        double_create_bucket: (true, |b: &Bucket<crate::tx::RwLock>| {
             b.create_bucket("abc").unwrap();
             match  b.create_bucket("abc") {
                 Ok(_) => panic!("Expected a BucketExists error"),
                 Err(e) => assert!(e == Error::BucketExists)
             }
         })
-        kv_bucket_mismatch: (true, |b: &Bucket| {
+        kv_bucket_mismatch: (true, |b: &Bucket<crate::tx::RwLock>| {
             b.put("abc", "def").unwrap();
             match  b.get_bucket("abc") {
                 Ok(_) => panic!("Expected a IncompatibleValue error"),
@@ -1146,7 +1146,7 @@ mod tests {
                 Err(e) => assert!(e == Error::IncompatibleValue)
             }
         })
-        bucket_kv_mismatch: (true, |b: &Bucket| {
+        bucket_kv_mismatch: (true, |b: &Bucket<crate::tx::RwLock>| {
             b.create_bucket("abc").unwrap();
             match b.put("abc", "def") {
                 Ok(_) => panic!("Expected a IncompatibleValue error"),
