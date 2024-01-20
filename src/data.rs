@@ -15,7 +15,7 @@ use crate::{bytes::Bytes, node::Leaf, ToBytes};
 ///
 /// # fn main() -> Result<(), Error> {
 /// let db = DB::open("my.db")?;
-/// let mut tx = db.tx(true)?;
+/// let mut tx = db.rw()?;
 /// let bucket = tx.create_bucket("my-bucket")?;
 ///
 /// if let Some(data) = bucket.get("my-key") {
@@ -83,7 +83,7 @@ impl<'b, 'tx> From<Leaf<'tx>> for Data<'b, 'tx> {
 ///
 /// # fn main() -> Result<(), Error> {
 /// let db = DB::open("my.db")?;
-/// let mut tx = db.tx(true)?;
+/// let mut tx = db.rw()?;
 /// let bucket = tx.create_bucket("my-bucket")?;
 ///
 /// bucket.create_bucket("my-nested-bucket")?;
@@ -143,7 +143,7 @@ impl<'b, 'tx> ToBytes<'tx> for &BucketName<'b, 'tx> {
 ///
 /// # fn main() -> Result<(), Error> {
 /// let db = DB::open("my.db")?;
-/// let mut tx = db.tx(false)?;
+/// let mut tx = db.ro()?;
 /// let bucket = tx.get_bucket("my-bucket")?;
 ///
 /// // put a key / value pair into the bucket

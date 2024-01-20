@@ -217,8 +217,16 @@ impl DB {
     /// Creates a [`Tx`].
     /// This transaction is either read-only or writable depending on the `writable` parameter.
     /// Please read the docs on a [`Tx`] for more details.
-    pub fn tx(&self, writable: bool) -> Result<Tx> {
-        Tx::new(self, writable)
+    // pub fn tx(&self, writable: bool) -> Result<Tx> {
+    //     Tx::new(self, writable)
+    // }
+
+    pub fn rw(&self) -> Result<Tx<crate::tx::RwLock>> {
+        Tx::<crate::tx::RwLock>::new(self)
+    }
+
+    pub fn ro(&self) -> Result<Tx<crate::tx::RoLock>> {
+        Tx::<crate::tx::RoLock>::new(self)
     }
 
     /// Returns the database's pagesize.
@@ -228,7 +236,7 @@ impl DB {
 
     #[doc(hidden)]
     pub fn check(&self) -> Result<()> {
-        self.tx(false)?.check()
+        self.ro()?.check()
     }
 }
 pub(crate) struct DBInner {

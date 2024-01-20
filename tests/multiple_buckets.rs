@@ -10,7 +10,7 @@ fn sibling_buckets() -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("abc")?;
             for i in 0..=10_u64 {
                 let existing = b.put(i.to_be_bytes(), i.to_string())?;
@@ -21,7 +21,7 @@ fn sibling_buckets() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
 
             let b = tx.get_bucket("abc")?;
             check_data(&b, 11, 1, vec![]);
@@ -43,7 +43,7 @@ fn sibling_buckets() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.get_bucket("abc")?;
             check_data(&b, 11, 4, vec![]);
             assert_eq!(b.next_int(), 11);
@@ -55,7 +55,7 @@ fn sibling_buckets() -> Result<(), Error> {
     }
     {
         let db = DB::open(&random_file.path)?;
-        let tx = db.tx(true)?;
+        let tx = db.rw()?;
         {
             let b = tx.get_bucket("abc")?;
             check_data(&b, 11, 4, vec![]);
@@ -77,7 +77,7 @@ fn nested_buckets() -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("abc")?;
             for i in 0..=10_u64 {
                 let existing = b.put(i.to_be_bytes(), i.to_string().repeat(2))?;
@@ -102,7 +102,7 @@ fn nested_buckets() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
 
             let b = tx.get_bucket("abc")?;
             check_data(&b, 12, 2, vec![Vec::from("def".as_bytes())]);
@@ -149,18 +149,18 @@ fn empty_nested_buckets() -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let _root = tx.get_or_create_bucket("ROOT")?;
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let root = tx.get_or_create_bucket("ROOT")?;
             let _child = root.get_or_create_bucket("CHILD")?;
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let root = tx.get_or_create_bucket("ROOT")?;
             let child = root.get_or_create_bucket("CHILD")?;
             child.put("A", "B")?;
@@ -168,14 +168,14 @@ fn empty_nested_buckets() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let root = tx.get_or_create_bucket("ROOT")?;
             let child = root.get_or_create_bucket("CHILD")?;
             let _grandchild = child.get_or_create_bucket("GRANDCHILD")?;
             tx.commit()?;
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let root = tx.get_or_create_bucket("ROOT")?;
             let child = root.get_or_create_bucket("CHILD")?;
             let grandchild = child.get_or_create_bucket("GRANDCHILD")?;

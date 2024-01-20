@@ -58,7 +58,7 @@ fn main() -> Result<(), Error> {
     let db = DB::open("my-database.db")?;
 
     // open a writable transaction so we can make changes
-    let tx = db.tx(true)?;
+    let tx = db.rw()?;
 
     // create a bucket to store a map of first names to last names
     let names_bucket = tx.create_bucket("names")?;
@@ -72,7 +72,7 @@ fn main() -> Result<(), Error> {
     // open the existing database file
     let db = DB::open("my-database.db")?;
     // open a read-only transaction to get the data
-    let tx = db.tx(false)?;
+    let tx = db.ro()?;
     // get the bucket we created in the last transaction
     let names_bucket = tx.get_bucket("names")?;
     // get the key/ value pair we inserted into the bucket
@@ -105,7 +105,7 @@ fn main() -> Result<(), Error> {
 {
     // open a new database file and start a writable transaction
     let db = DB::open("my-database.db")?;
-    let tx = db.tx(true)?;
+    let tx = db.rw()?;
 
     // create a bucket to store users
     let users_bucket = tx.create_bucket("users")?;
@@ -121,7 +121,7 @@ fn main() -> Result<(), Error> {
     // open the existing database file
     let db = DB::open("my-database.db")?;
     // open a read-only transaction to get the data
-    let tx = db.tx(false)?;
+    let tx = db.ro()?;
     // get the bucket we created in the last transaction
     let users_bucket = tx.get_bucket("users")?;
     // get the key / value pair we inserted into the bucket

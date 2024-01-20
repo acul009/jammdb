@@ -7,8 +7,8 @@ fn tx_isolation() -> Result<(), Error> {
     let random_file = common::RandomFile::new();
     let db = OpenOptions::new().strict_mode(true).open(&random_file)?;
     {
-        let ro_tx = db.tx(false)?;
-        let wr_tx = db.tx(true)?;
+        let ro_tx = db.ro()?;
+        let wr_tx = db.rw()?;
         let b = wr_tx.create_bucket("abc123")?;
 
         for i in 0..=10_u64 {
@@ -28,10 +28,10 @@ fn tx_isolation() -> Result<(), Error> {
         wr_tx.commit()?;
     }
     {
-        let ro_tx = db.tx(false)?;
+        let ro_tx = db.ro()?;
         let ro_b = ro_tx.get_bucket("abc123")?;
         check_data(&ro_b, 11, 1);
-        let rw_tx = db.tx(true)?;
+        let rw_tx = db.rw()?;
         let rw_b = rw_tx.get_bucket("abc123")?;
         check_data(&rw_b, 11, 1);
         assert_eq!(ro_b.next_int(), 11);

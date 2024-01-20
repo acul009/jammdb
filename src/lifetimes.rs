@@ -11,7 +11,7 @@
 ///         let db = DB::open("my-database.db")?;
 ///
 ///         // open a writable transaction so we can make changes
-///         tx = db.tx(true)?;
+///         tx = db.rw()?;
 ///     }
 ///     let names_bucket = tx.get_bucket("names")?;
 ///     Ok(())
@@ -33,7 +33,7 @@ struct TxLifetime();
 ///     let b: Bucket;
 ///     {
 ///         // open a writable transaction so we can make changes
-///         let tx = db.tx(true)?;
+///         let tx = db.rw()?;
 ///         b = tx.get_bucket("names")?;
 ///     }
 ///     b.put("abc", "def");
@@ -56,7 +56,7 @@ struct BucketLifetime();
 ///     let kv: KVPair;
 ///     {
 ///         // open a writable transaction so we can make changes
-///         let tx = db.tx(true)?;
+///         let tx = db.rw()?;
 ///         let b = tx.get_bucket("names")?;
 ///         kv = b.get_kv("data").unwrap();
 ///     }

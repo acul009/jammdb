@@ -188,7 +188,7 @@ impl<'n> Node<'n> {
 
     pub(crate) fn spill<'a>(
         &'a mut self,
-        bucket: &'a mut InnerBucket<'n>,
+        bucket: &'a mut InnerBucket<'n, crate::tx::RwLock>,
         tx_freelist: &'a mut TxFreelist,
         parent: Option<&'a mut Self>,
     ) -> Result<Option<PageID>> {
@@ -281,7 +281,7 @@ impl<'n> Node<'n> {
 
     pub(crate) fn split<'a>(
         &'a mut self,
-        bucket: &'a mut InnerBucket<'n>,
+        bucket: &'a mut InnerBucket<'n, crate::tx::RwLock>,
     ) -> Option<Vec<Rc<RefCell<Node<'n>>>>> {
         if self.data.len() <= (MIN_KEYS_PER_NODE * 2) || self.size() < self.pagesize {
             return None;
@@ -549,7 +549,7 @@ mod test {
         let db = OpenOptions::new().pagesize(1024).open(&random_file)?;
         // Test split
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("a")?;
             let mut data = HashMap::new();
             // Insert six nodes, each the size of a page.

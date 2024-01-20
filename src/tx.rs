@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashSet,
+    fmt::Display,
     fs::File,
     io::{Seek, SeekFrom, Write},
     marker::PhantomData,
@@ -61,9 +62,9 @@ impl<'tx> TxLock<'tx> {
 /// # fn main() -> Result<(), Error> {
 /// # let db = DB::open("my.db")?;
 /// // create a read-only transaction
-/// let mut tx1 = db.tx(false)?;
+/// let mut tx1 = db.ro()?;
 /// // create a writable transcation
-/// let mut tx2 = db.tx(true)?;
+/// let mut tx2 = db.rw()?;
 ///
 /// // create a new bucket in the writable transaction
 /// tx2.create_bucket("new-bucket")?;
@@ -94,45 +95,85 @@ impl<'tx> TxLock<'tx> {
 /// <sup>2</sup> Keep in mind that long running read-only transactions will prevent the database from
 /// reclaiming old pages and your database may increase in disk size quickly if you're writing lots of data,
 /// so it's a good idea to keep transactions short.
-pub struct Tx<'tx> {
-    pub(crate) inner: RefCell<TxInner<'tx>>,
+pub struct Tx<'tx, Lock: TxL> {
+    pub(crate) inner: RefCell<TxInner<'tx, Lock>>,
 }
 
-pub(crate) struct TxInner<'tx> {
+pub(crate) type RwLock<'tx> = MutexGuard<'tx, File>;
+impl<'tx> TxL for RwLock<'tx> {
+    fn writeable(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) type RoLock<'tx> = RwLockReadGuard<'tx, ()>;
+impl<'tx> TxL for RoLock<'tx> {
+    fn writeable(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) trait TxL {
+    fn writeable(&self) -> bool;
+}
+
+pub(crate) struct TxInner<'tx, Lock: TxL> {
     pub(crate) db: &'tx DB,
-    pub(crate) lock: TxLock<'tx>,
-    pub(crate) root: Rc<RefCell<InnerBucket<'tx>>>,
+    pub(crate) lock: Lock,
+    pub(crate) root: Rc<RefCell<InnerBucket<'tx, Lock>>>,
     pub(crate) meta: Meta,
     pub(crate) freelist: Rc<RefCell<TxFreelist>>,
     pages: Pages,
     num_freelist_pages: u64,
 }
 
-impl<'tx> Tx<'tx> {
-    pub(crate) fn new(db: &'tx DB, writable: bool) -> Result<Tx<'tx>> {
-        let lock = match writable {
-            true => TxLock::Rw(db.inner.file.lock()?),
-            false => TxLock::Ro(db.inner.mmap_lock.read()?),
-        };
+impl<'tx> Tx<'tx, RwLock<'tx>> {
+    pub(crate) fn new(db: &'tx DB) -> Result<Tx<'tx, RwLock>> {
+        let lock = db.inner.file.lock()?;
+
         let mut freelist = db.inner.freelist.lock()?.clone();
         let mut meta = db.inner.meta()?;
         debug_assert!(meta.valid());
         {
             let mut open_ro_txs = db.inner.open_ro_txs.lock().unwrap();
-            if writable {
-                meta.tx_id += 1;
-                if open_ro_txs.len() > 0 {
-                    freelist.release(open_ro_txs[0]);
-                } else {
-                    freelist.release(meta.tx_id);
-                }
+            meta.tx_id += 1;
+            if open_ro_txs.len() > 0 {
+                freelist.release(open_ro_txs[0]);
             } else {
-                open_ro_txs.push(meta.tx_id);
-                open_ro_txs.sort_unstable();
+                freelist.release(meta.tx_id);
             }
         }
         let freelist = Rc::new(RefCell::new(TxFreelist::new(meta.clone(), freelist)));
 
+        Tx::<RwLock>::new_helper(db, lock, meta, freelist)
+    }
+}
+
+impl<'tx> Tx<'tx, RoLock<'tx>> {
+    pub(crate) fn new(db: &'tx DB) -> Result<Tx<'tx, RoLock>> {
+        let lock = db.inner.mmap_lock.read()?;
+
+        let mut freelist = db.inner.freelist.lock()?.clone();
+        let mut meta = db.inner.meta()?;
+        debug_assert!(meta.valid());
+        {
+            let mut open_ro_txs = db.inner.open_ro_txs.lock().unwrap();
+            open_ro_txs.push(meta.tx_id);
+            open_ro_txs.sort_unstable();
+        }
+        let freelist = Rc::new(RefCell::new(TxFreelist::new(meta.clone(), freelist)));
+
+        Tx::<RoLock>::new_helper(db, lock, meta, freelist)
+    }
+}
+
+impl<'tx, Lock: TxL> Tx<'tx, Lock> {
+    fn new_helper(
+        db: &'tx DB,
+        lock: Lock,
+        meta: Meta,
+        freelist: Rc<RefCell<TxFreelist>>,
+    ) -> Result<Tx<'tx, Lock>> {
         let data = db.inner.data.lock()?.clone();
         let pages = Pages::new(data, db.inner.pagesize);
         let num_freelist_pages = pages.page(meta.freelist_page).overflow + 1;
@@ -152,10 +193,6 @@ impl<'tx> Tx<'tx> {
         })
     }
 
-    pub(crate) fn writable(&self) -> bool {
-        self.inner.borrow().lock.writable()
-    }
-
     /// Returns a reference to the root level bucket with the given name.
     ///
     /// # Errors
@@ -164,18 +201,38 @@ impl<'tx> Tx<'tx> {
     /// or an [`IncompatibleValue`](enum.Error.html#variant.IncompatibleValue) error if the key exists but is not a bucket.
     ///
     /// In a read-only transaction, you will get an error when trying to use any of the bucket's methods that modify data.    
-    pub fn get_bucket<'b, T: ToBytes<'tx>>(&'b self, name: T) -> Result<Bucket<'b, 'tx>> {
+    pub fn get_bucket<'b, T: ToBytes<'tx>>(&'b self, name: T) -> Result<Bucket<'b, 'tx, Lock>> {
         let tx = self.inner.borrow();
         let mut root = tx.root.borrow_mut();
         let inner = root.get_bucket(name)?;
         Ok(Bucket {
             inner,
             freelist: tx.freelist.clone(),
-            writable: tx.lock.writable(),
+            _tx_type: PhantomData,
             _phantom: PhantomData,
         })
     }
 
+    /// Iterator over the root level buckets
+    pub fn buckets<'b>(
+        &'b self,
+    ) -> impl Iterator<Item = (BucketName<'b, 'tx>, Bucket<'b, 'tx, Lock>)> {
+        let tx = self.inner.borrow();
+        let bucket = Bucket {
+            inner: tx.root.clone(),
+            freelist: tx.freelist.clone(),
+            _phantom: PhantomData,
+            _tx_type: PhantomData,
+        };
+        bucket.cursor().to_buckets()
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        self.inner.borrow().check()
+    }
+}
+
+impl<'tx> Tx<'tx, RwLock<'tx>> {
     /// Creates a new bucket with the given name and returns a reference it.
     ///
     /// # Errors
@@ -183,18 +240,18 @@ impl<'tx> Tx<'tx> {
     /// Will return a [`BucketExists`](enum.Error.html#variant.BucketExists) error if the bucket already exists,
     /// an [`IncompatibleValue`](enum.Error.html#variant.IncompatibleValue) error if the key exists but is not a bucket,
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
-    pub fn create_bucket<'b, T: ToBytes<'tx>>(&'b self, name: T) -> Result<Bucket<'b, 'tx>> {
+    pub fn create_bucket<'b, T: ToBytes<'tx>>(
+        &'b self,
+        name: T,
+    ) -> Result<Bucket<'b, 'tx, RwLock>> {
         let tx = self.inner.borrow();
-        if !tx.lock.writable() {
-            return Err(Error::ReadOnlyTx);
-        }
         let mut root = tx.root.borrow_mut();
         let inner = root.create_bucket(name)?;
         Ok(Bucket {
             inner,
             freelist: tx.freelist.clone(),
-            writable: true,
             _phantom: PhantomData,
+            _tx_type: PhantomData,
         })
     }
 
@@ -205,18 +262,18 @@ impl<'tx> Tx<'tx> {
     ///
     /// Will return an [`IncompatibleValue`](enum.Error.html#variant.IncompatibleValue) error if the key exists but is not a bucket,
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
-    pub fn get_or_create_bucket<'b, T: ToBytes<'tx>>(&'b self, name: T) -> Result<Bucket<'b, 'tx>> {
+    pub fn get_or_create_bucket<'b, T: ToBytes<'tx>>(
+        &'b self,
+        name: T,
+    ) -> Result<Bucket<'b, 'tx, RwLock>> {
         let tx = self.inner.borrow();
-        if !tx.lock.writable() {
-            return Err(Error::ReadOnlyTx);
-        }
         let mut root = tx.root.borrow_mut();
         let inner = root.get_or_create_bucket(name)?;
         Ok(Bucket {
             inner,
             freelist: tx.freelist.clone(),
-            writable: true,
             _phantom: PhantomData,
+            _tx_type: PhantomData,
         })
     }
 
@@ -229,25 +286,10 @@ impl<'tx> Tx<'tx> {
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
     pub fn delete_bucket<T: ToBytes<'tx>>(&self, key: T) -> Result<()> {
         let tx = self.inner.borrow();
-        if !tx.lock.writable() {
-            return Err(Error::ReadOnlyTx);
-        }
         let freelist = tx.freelist.clone();
         let mut freelist = freelist.borrow_mut();
         let mut root = tx.root.borrow_mut();
         root.delete_bucket(key, &mut freelist)
-    }
-
-    /// Iterator over the root level buckets
-    pub fn buckets<'b>(&'b self) -> impl Iterator<Item = (BucketName<'b, 'tx>, Bucket<'b, 'tx>)> {
-        let tx = self.inner.borrow();
-        let bucket = Bucket {
-            inner: tx.root.clone(),
-            freelist: tx.freelist.clone(),
-            writable: tx.lock.writable(),
-            _phantom: PhantomData,
-        };
-        bucket.cursor().to_buckets()
     }
 
     /// Writes the changes made in the writeable transaction to the underlying file.
@@ -257,9 +299,6 @@ impl<'tx> Tx<'tx> {
     /// Will return an [`IOError`](enum.Error.html#variant.IOError) error if there are any io errors while writing to disk,
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
     pub fn commit(self) -> Result<()> {
-        if !self.writable() {
-            return Err(Error::ReadOnlyTx);
-        }
         let mut tx = self.inner.borrow_mut();
         let freelist = tx.freelist.clone();
         let mut freelist = freelist.borrow_mut();
@@ -271,91 +310,9 @@ impl<'tx> Tx<'tx> {
         tx.meta.root = meta;
         tx.write_data(&mut freelist)
     }
-
-    pub(crate) fn check(&self) -> Result<()> {
-        self.inner.borrow().check()
-    }
 }
 
-impl<'tx> TxInner<'tx> {
-    fn write_data(&mut self, freelist: &mut TxFreelist) -> Result<()> {
-        if let TxLock::Rw(file) = &mut self.lock {
-            // Write the freelist to a new page
-            {
-                freelist.free(self.meta.freelist_page, self.num_freelist_pages);
-                let freelist_size = freelist.inner.size();
-                let page = freelist.allocate(freelist_size)?;
-                self.meta.freelist_page = page.id;
-                let free_page_ids = freelist.inner.pages();
-                page.page_type = Page::TYPE_FREELIST;
-                page.count = free_page_ids.len() as u64;
-                page.freelist_mut()
-                    .copy_from_slice(free_page_ids.as_slice());
-            }
-
-            // Update our num_pages from the freelist now that we've allocated everything
-            self.meta.num_pages = freelist.meta.num_pages;
-
-            // Grow the file, if needed
-            let required_size = self.meta.num_pages * self.db.inner.pagesize;
-            let current_size = file.metadata()?.len();
-            if current_size < required_size {
-                let size_diff = required_size - current_size;
-                let alloc_size = ((size_diff / MIN_ALLOC_SIZE) + 1) * MIN_ALLOC_SIZE;
-                let data = self.db.inner.resize(file, current_size + alloc_size)?;
-                self.pages = Pages::new(data, self.db.inner.pagesize);
-            }
-
-            // write the data to the file
-            {
-                // freelist.pages is a BTreeMap so we're writing the pages in order to minmize
-                // the random seeks.
-                for (page_id, (ptr, size)) in freelist.pages.iter() {
-                    let buf = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *size) };
-                    file.seek(SeekFrom::Start(self.db.inner.pagesize * page_id))?;
-                    file.write_all(buf)?;
-                }
-            }
-        }
-        if self.db.inner.flags.strict_mode {
-            self.check()?;
-        }
-        if let TxLock::Rw(file) = &mut self.lock {
-            // write meta page to file
-            {
-                let mut buf = vec![0; self.db.inner.pagesize as usize];
-
-                #[allow(clippy::cast_ptr_alignment)]
-                let page = unsafe { &mut *(&mut buf[0] as *mut u8 as *mut Page) };
-                let meta_page_id = u64::from(self.meta.meta_page == 0);
-                page.id = meta_page_id;
-                page.page_type = Page::TYPE_META;
-                let m = page.meta_mut();
-                m.meta_page = meta_page_id as u32;
-                m.magic = self.meta.magic;
-                m.version = self.meta.version;
-                m.pagesize = self.meta.pagesize;
-                m.root = self.meta.root;
-                m.num_pages = self.meta.num_pages;
-                m.freelist_page = self.meta.freelist_page;
-                m.tx_id = self.meta.tx_id;
-                m.hash = m.hash_self();
-
-                file.seek(SeekFrom::Start(self.db.inner.pagesize * meta_page_id))?;
-                file.write_all(buf.as_slice())?;
-            }
-
-            file.flush()?;
-            file.sync_all()?;
-
-            let mut lock = self.db.inner.freelist.lock()?;
-            *lock = freelist.inner.clone();
-            Ok(())
-        } else {
-            unreachable!()
-        }
-    }
-
+impl<'tx, Lock: TxL> TxInner<'tx, Lock> {
     fn check(&self) -> Result<()> {
         let mut unused_pages: HashSet<PageID> = (2..self.meta.num_pages).collect();
         let mut page_stack = Vec::new();
@@ -474,9 +431,84 @@ impl<'tx> TxInner<'tx> {
     }
 }
 
-impl<'tx> Drop for TxInner<'tx> {
+impl<'tx> TxInner<'tx, RwLock<'tx>> {
+    fn write_data(&mut self, freelist: &mut TxFreelist) -> Result<()> {
+        let file = &mut self.lock;
+        // Write the freelist to a new page
+        {
+            freelist.free(self.meta.freelist_page, self.num_freelist_pages);
+            let freelist_size = freelist.inner.size();
+            let page = freelist.allocate(freelist_size)?;
+            self.meta.freelist_page = page.id;
+            let free_page_ids = freelist.inner.pages();
+            page.page_type = Page::TYPE_FREELIST;
+            page.count = free_page_ids.len() as u64;
+            page.freelist_mut()
+                .copy_from_slice(free_page_ids.as_slice());
+        }
+
+        // Update our num_pages from the freelist now that we've allocated everything
+        self.meta.num_pages = freelist.meta.num_pages;
+
+        // Grow the file, if needed
+        let required_size = self.meta.num_pages * self.db.inner.pagesize;
+        let current_size = file.metadata()?.len();
+        if current_size < required_size {
+            let size_diff = required_size - current_size;
+            let alloc_size = ((size_diff / MIN_ALLOC_SIZE) + 1) * MIN_ALLOC_SIZE;
+            let data = self.db.inner.resize(file, current_size + alloc_size)?;
+            self.pages = Pages::new(data, self.db.inner.pagesize);
+        }
+
+        // write the data to the file
+        {
+            // freelist.pages is a BTreeMap so we're writing the pages in order to minmize
+            // the random seeks.
+            for (page_id, (ptr, size)) in freelist.pages.iter() {
+                let buf = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *size) };
+                file.seek(SeekFrom::Start(self.db.inner.pagesize * page_id))?;
+                file.write_all(buf)?;
+            }
+        }
+        if self.db.inner.flags.strict_mode {
+            self.check()?;
+        }
+        // write meta page to file
+        {
+            let mut buf = vec![0; self.db.inner.pagesize as usize];
+
+            #[allow(clippy::cast_ptr_alignment)]
+            let page = unsafe { &mut *(&mut buf[0] as *mut u8 as *mut Page) };
+            let meta_page_id = u64::from(self.meta.meta_page == 0);
+            page.id = meta_page_id;
+            page.page_type = Page::TYPE_META;
+            let m = page.meta_mut();
+            m.meta_page = meta_page_id as u32;
+            m.magic = self.meta.magic;
+            m.version = self.meta.version;
+            m.pagesize = self.meta.pagesize;
+            m.root = self.meta.root;
+            m.num_pages = self.meta.num_pages;
+            m.freelist_page = self.meta.freelist_page;
+            m.tx_id = self.meta.tx_id;
+            m.hash = m.hash_self();
+
+            file.seek(SeekFrom::Start(self.db.inner.pagesize * meta_page_id))?;
+            file.write_all(buf.as_slice())?;
+        }
+
+        file.flush()?;
+        file.sync_all()?;
+
+        let mut lock = self.db.inner.freelist.lock()?;
+        *lock = freelist.inner.clone();
+        Ok(())
+    }
+}
+
+impl<'tx, Lock: TxL> Drop for TxInner<'tx, Lock> {
     fn drop(&mut self) {
-        if !self.lock.writable() {
+        if !self.lock.writeable() {
             let mut open_txs = self.db.inner.open_ro_txs.lock().unwrap();
             let index = match open_txs.binary_search(&self.meta.tx_id) {
                 Ok(i) => i,
@@ -503,18 +535,13 @@ mod tests {
         let db = DB::open(&random_file)?;
 
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             assert!(tx.create_bucket("abc").is_ok());
             tx.commit()?;
         }
 
-        let tx = db.tx(false)?;
-        assert!(tx.create_bucket("def").is_err());
+        let tx = db.ro()?;
         let b = tx.get_bucket("abc")?;
-        assert_eq!(b.put("key", "value"), Err(Error::ReadOnlyTx));
-        assert_eq!(b.delete("key"), Err(Error::ReadOnlyTx));
-        assert_eq!(b.create_bucket("dev").err(), Some(Error::ReadOnlyTx));
-        assert_eq!(tx.commit(), Err(Error::ReadOnlyTx));
 
         Ok(())
     }
@@ -529,11 +556,9 @@ mod tests {
             .open(&random_file)?;
         {
             // create a read-only tx
-            let tx = db.tx(false)?;
-            assert!(!tx.writable());
+            let tx = db.ro()?;
             let tx = tx.inner.borrow_mut();
             assert_eq!(tx.pages.data.len(), 1024 * 10);
-            assert!(!tx.lock.writable());
             {
                 let open_ro_txs = tx.db.inner.open_ro_txs.lock().unwrap();
                 assert_eq!(open_ro_txs.len(), 1);
@@ -541,8 +566,7 @@ mod tests {
             }
             {
                 // create a writable transaction while the read-only transaction is still open
-                let tx = db.tx(true)?;
-                assert!(tx.writable());
+                let tx = db.rw()?;
                 {
                     {
                         let inner = tx.inner.borrow_mut();
@@ -557,8 +581,7 @@ mod tests {
             }
             {
                 // create a second writable transaction while the read-only transaction is still open
-                let tx = db.tx(true)?;
-                assert!(tx.writable());
+                let tx = db.rw()?;
                 {
                     {
                         let inner = tx.inner.borrow_mut();
@@ -575,8 +598,7 @@ mod tests {
         }
         {
             // make sure we can reuse the freelist
-            let tx = db.tx(true)?;
-            assert!(tx.writable());
+            let tx = db.rw()?;
             let inner = tx.inner.borrow_mut();
             let mut freelist = inner.freelist.borrow_mut();
             assert_eq!(freelist.inner.pages(), vec![2, 3, 4, 5, 6]);

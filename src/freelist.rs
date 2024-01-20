@@ -285,7 +285,7 @@ mod tests {
             .pagesize(1024)
             .num_pages(4)
             .open(&random_file)?;
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         let tx = tx.inner.borrow_mut();
         let mut freelist = tx.freelist.borrow_mut();
         // make sure we have an empty freelist and only four pages
@@ -320,7 +320,7 @@ mod tests {
             .pagesize(1024)
             .num_pages(100)
             .open(&random_file)?;
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         let tx = tx.inner.borrow_mut();
         let mut freelist = tx.freelist.borrow_mut();
 
@@ -359,7 +359,7 @@ mod tests {
             .pagesize(1024)
             .num_pages(100)
             .open(&random_file)?;
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         let tx = tx.inner.borrow_mut();
         let mut freelist = tx.freelist.borrow_mut();
 

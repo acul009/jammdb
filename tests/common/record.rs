@@ -47,7 +47,7 @@ impl TestDetails {
         for _iter in 0..self.iterations {
             {
                 instructions.push(Instruction::StartTx);
-                let tx = db.tx(true)?;
+                let tx = db.rw()?;
 
                 let bucket_paths = self
                     .buckets
@@ -129,7 +129,7 @@ impl TestDetails {
             db.check()?;
             {
                 // Check the database to make sure everything is valid
-                let tx = db.tx(false)?;
+                let tx = db.ro()?;
                 for (bucket_data, bucket) in tx.buckets() {
                     let data = data.sub_bucket(Bytes::copy_from_slice(bucket_data.name()));
                     assert!(data.is_bucket());
@@ -350,7 +350,7 @@ pub fn log_playback(name: &str) -> Result<(), Error> {
             Instruction::ResetBucket => {
                 bucket_path.clear();
             }
-            Instruction::StartTx => tx = Some(db.tx(true)?),
+            Instruction::StartTx => tx = Some(db.rw()?),
             Instruction::EndTx => {
                 bucket_path.clear();
                 let tx = tx.take().unwrap();
@@ -360,7 +360,7 @@ pub fn log_playback(name: &str) -> Result<(), Error> {
 
                 {
                     // Check the database to make sure everything is valid
-                    let tx = db.tx(false)?;
+                    let tx = db.ro()?;
 
                     for (bucket_data, bucket) in tx.buckets() {
                         let data = root.sub_bucket(Bytes::copy_from_slice(bucket_data.name()));

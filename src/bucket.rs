@@ -41,7 +41,7 @@ use crate::{
 ///
 /// # fn main() -> Result<(), Error> {
 /// let db = DB::open("my.db")?;
-/// let mut tx = db.tx(true)?;
+/// let mut tx = db.rw()?;
 ///
 /// // create a root-level bucket
 /// let bucket = tx.create_bucket("my-bucket")?;
@@ -71,58 +71,14 @@ use crate::{
 /// That means it is possible to obtain a reference to a bucket, then delete that bucket from the parent. Do not do this.
 /// If you try to use a bucket that has been deleted it will panic, and nobody wants that 🙃.
 /// The same is true for any iterator over a bucket as well, like a [`Cursor`], [`Buckets`], or [`KVPairs`].
-pub struct Bucket<'b, 'tx: 'b> {
-    pub(crate) inner: Rc<RefCell<InnerBucket<'tx>>>,
+pub struct Bucket<'b, 'tx: 'b, TxType: crate::tx::TxL> {
+    pub(crate) inner: Rc<RefCell<InnerBucket<'tx, TxType>>>,
     pub(crate) freelist: Rc<RefCell<TxFreelist>>,
-    pub(crate) writable: bool,
+    pub(crate) _tx_type: PhantomData<TxType>,
     pub(crate) _phantom: PhantomData<&'b ()>,
 }
 
-impl<'b, 'tx> Bucket<'b, 'tx> {
-    /// Adds to or replaces key / value data in the bucket.
-    /// Returns an error if the key currently exists but is a bucket instead of a key / value pair.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use jammdb::{DB};
-    /// # use jammdb::Error;
-    ///
-    /// # fn main() -> Result<(), Error> {
-    /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(true)?;
-    ///
-    /// // create a root-level bucket
-    /// let bucket = tx.create_bucket("my-bucket")?;
-    ///
-    /// // insert data
-    /// bucket.put("123", "456")?;
-    ///
-    /// // update data
-    /// bucket.put("123", "789")?;
-    ///
-    /// bucket.create_bucket("nested-bucket")?;
-    ///
-    /// assert!(bucket.put("nested-bucket", "data").is_err());
-    ///
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn put<'a, T: ToBytes<'tx>, S: ToBytes<'tx>>(
-        &'a self,
-        key: T,
-        value: S,
-    ) -> Result<Option<KVPair<'b, 'tx>>> {
-        if !self.writable {
-            return Err(Error::ReadOnlyTx);
-        }
-        let mut b = self.inner.borrow_mut();
-        if b.deleted {
-            panic!("Cannot put data into a deleted bucket.");
-        }
-        Ok(b.put(key, value)?.map(|v| v.into()))
-    }
-
+impl<'b, 'tx, TxType: crate::tx::TxL> Bucket<'b, 'tx, TxType> {
     pub fn get<'a, T: AsRef<[u8]>>(&'a self, key: T) -> Option<Data<'b, 'tx>> {
         let mut b = self.inner.borrow_mut();
         if b.deleted {
@@ -142,40 +98,6 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
         }
     }
 
-    /// Deletes a key / value pair from the bucket
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use jammdb::{DB};
-    /// # use jammdb::Error;
-    ///
-    /// # fn main() -> Result<(), Error> {
-    /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(false)?;
-    ///
-    /// let bucket = tx.get_bucket("my-bucket")?;
-    /// // check if data is there
-    /// assert!(bucket.get_kv("some-key").is_some());
-    /// // delete the key / value pair
-    /// bucket.delete("some-key")?;
-    /// // data should no longer exist
-    /// assert!(bucket.get_kv("some-key").is_none());
-    ///
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn delete<T: AsRef<[u8]>>(&self, key: T) -> Result<KVPair> {
-        if !self.writable {
-            return Err(Error::ReadOnlyTx);
-        }
-        let mut b = self.inner.borrow_mut();
-        if b.deleted {
-            panic!("Cannot delete data from a deleted bucket.");
-        }
-        Ok(b.delete(key)?.into())
-    }
-
     /// Gets an already created bucket.
     ///
     /// Returns an error if
@@ -190,7 +112,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     ///
     /// # fn main() -> Result<(), Error> {
     /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(false)?;
+    /// let mut tx = db.ro()?;
     ///
     /// // get a root-level bucket
     /// let bucket = tx.get_bucket("my-bucket")?;
@@ -204,7 +126,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_bucket<'a, T: ToBytes<'tx>>(&'a self, name: T) -> Result<Bucket<'b, 'tx>> {
+    pub fn get_bucket<'a, T: ToBytes<'tx>>(&'a self, name: T) -> Result<Bucket<'b, 'tx, TxType>> {
         let mut b = self.inner.borrow_mut();
         if b.deleted {
             panic!("Cannot get bucket from a deleted bucket.");
@@ -213,138 +135,9 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
         Ok(Bucket {
             inner,
             freelist: self.freelist.clone(),
-            writable: self.writable,
+            _tx_type: self._tx_type,
             _phantom: PhantomData,
         })
-    }
-
-    /// Creates a new bucket.
-    ///
-    /// Returns an error if
-    /// 1. the given key already exists
-    /// 2. It is in a read-only transaction
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use jammdb::{DB};
-    /// # use jammdb::Error;
-    ///
-    /// # fn main() -> Result<(), Error> {
-    /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(true)?;
-    ///
-    /// // create a root-level bucket
-    /// let bucket = tx.create_bucket("my-bucket")?;
-    ///
-    /// // create nested bucket
-    /// let mut sub_bucket = bucket.create_bucket("nested-bucket")?;
-    ///
-    /// // create nested bucket
-    /// let mut sub_sub_bucket = sub_bucket.create_bucket("double-nested-bucket")?;
-    ///
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn create_bucket<'a, T: ToBytes<'tx>>(&'a self, name: T) -> Result<Bucket<'b, 'tx>> {
-        if !self.writable {
-            return Err(Error::ReadOnlyTx);
-        }
-        let mut b = self.inner.borrow_mut();
-        if b.deleted {
-            panic!("Cannot create bucket in a deleted bucket.");
-        }
-        let inner = b.create_bucket(name)?;
-        Ok(Bucket {
-            inner,
-            freelist: self.freelist.clone(),
-            writable: self.writable,
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Creates a new bucket if it doesn't exist
-    ///
-    /// Returns an error if
-    /// 1. It is in a read-only transaction
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use jammdb::{DB};
-    /// # use jammdb::Error;
-    ///
-    /// # fn main() -> Result<(), Error> {
-    /// let db = DB::open("my.db")?;
-    /// {
-    ///     let mut tx = db.tx(true)?;
-    ///     // create a root-level bucket
-    ///     let bucket = tx.get_or_create_bucket("my-bucket")?;
-    ///     tx.commit()?;
-    /// }
-    /// {
-    ///     let mut tx = db.tx(true)?;
-    ///     // get the existing a root-level bucket
-    ///     let bucket = tx.get_or_create_bucket("my-bucket")?;
-    /// }
-    ///
-    /// # Ok(())
-    /// # }
-    /// ```    
-    pub fn get_or_create_bucket<'a, T: ToBytes<'tx>>(&'a self, name: T) -> Result<Bucket<'b, 'tx>> {
-        if !self.writable {
-            return Err(Error::ReadOnlyTx);
-        }
-        let mut b = self.inner.borrow_mut();
-        if b.deleted {
-            panic!("Cannot get or create bucket from a deleted bucket.");
-        }
-        let inner = b.get_or_create_bucket(name)?;
-        Ok(Bucket {
-            inner,
-            freelist: self.freelist.clone(),
-            writable: self.writable,
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Deletes an bucket.
-    ///
-    /// Returns an error if
-    /// 1. the given key does not exist
-    /// 2. the key is for key / value data, not a bucket
-    /// 3. It is in a read-only transaction
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use jammdb::{DB};
-    /// # use jammdb::Error;
-    ///
-    /// # fn main() -> Result<(), Error> {
-    /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(true)?;
-    ///
-    /// // get a root-level bucket
-    /// let bucket = tx.get_bucket("my-bucket")?;
-    ///
-    /// // delete nested bucket
-    /// bucket.delete_bucket("nested-bucket")?;
-    ///
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn delete_bucket<T: ToBytes<'tx>>(&self, key: T) -> Result<()> {
-        if !self.writable {
-            return Err(Error::ReadOnlyTx);
-        }
-
-        let mut freelist = self.freelist.borrow_mut();
-        let mut b = self.inner.borrow_mut();
-        if b.deleted {
-            panic!("Cannot delete bucket from a deleted bucket.");
-        }
-        b.delete_bucket(key, &mut freelist)
     }
 
     /// Get a cursor to iterate over the bucket.
@@ -358,7 +151,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     ///
     /// # fn main() -> Result<(), Error> {
     /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(false)?;
+    /// let mut tx = db.ro()?;
     ///
     /// let bucket = tx.get_bucket("my-bucket")?;
     ///
@@ -372,7 +165,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn cursor<'a>(&'a self) -> Cursor<'b, 'tx> {
+    pub fn cursor<'a>(&'a self) -> Cursor<'b, 'tx, TxType> {
         {
             let b = self.inner.borrow();
             if b.deleted {
@@ -395,7 +188,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     ///
     /// # fn main() -> Result<(), Error> {
     /// let db = DB::open("my.db")?;
-    /// let mut tx = db.tx(true)?;
+    /// let mut tx = db.rw()?;
     ///
     /// // create a root-level bucket
     /// let bucket = tx.create_bucket("my-bucket")?;
@@ -427,7 +220,9 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     }
 
     /// Iterator over the sub-buckets in this bucket.
-    pub fn buckets<'a>(&'a self) -> impl Iterator<Item = (BucketName<'b, 'tx>, Bucket<'b, 'tx>)> {
+    pub fn buckets<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = (BucketName<'b, 'tx>, Bucket<'b, 'tx, TxType>)> {
         self.cursor().to_buckets()
     }
 
@@ -436,7 +231,7 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
         self.cursor().to_kv_pairs()
     }
 
-    pub fn range<'a, R>(&'a self, r: R) -> Range<'a, 'b, 'tx, R>
+    pub fn range<'a, R>(&'a self, r: R) -> Range<'a, 'b, 'tx, R, TxType>
     where
         R: RangeBounds<&'a [u8]>,
     {
@@ -448,32 +243,233 @@ impl<'b, 'tx> Bucket<'b, 'tx> {
     }
 }
 
+/// Methods which are available during a writeable Transaction
+impl<'b, 'tx> Bucket<'b, 'tx, crate::tx::RwLock<'tx>> {
+    /// Adds to or replaces key / value data in the bucket.
+    /// Returns an error if the key currently exists but is a bucket instead of a key / value pair.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use jammdb::{DB};
+    /// # use jammdb::Error;
+    ///
+    /// # fn main() -> Result<(), Error> {
+    /// let db = DB::open("my.db")?;
+    /// let mut tx = db.rw()?;
+    ///
+    /// // create a root-level bucket
+    /// let bucket = tx.create_bucket("my-bucket")?;
+    ///
+    /// // insert data
+    /// bucket.put("123", "456")?;
+    ///
+    /// // update data
+    /// bucket.put("123", "789")?;
+    ///
+    /// bucket.create_bucket("nested-bucket")?;
+    ///
+    /// assert!(bucket.put("nested-bucket", "data").is_err());
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put<'a, T: ToBytes<'tx>, S: ToBytes<'tx>>(
+        &'a self,
+        key: T,
+        value: S,
+    ) -> Result<Option<KVPair<'b, 'tx>>> {
+        let mut b = self.inner.borrow_mut();
+        if b.deleted {
+            panic!("Cannot put data into a deleted bucket.");
+        }
+        Ok(b.put(key, value)?.map(|v| v.into()))
+    }
+
+    /// Deletes a key / value pair from the bucket
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use jammdb::{DB};
+    /// # use jammdb::Error;
+    ///
+    /// # fn main() -> Result<(), Error> {
+    /// let db = DB::open("my.db")?;
+    /// let mut tx = db.ro()?;
+    ///
+    /// let bucket = tx.get_bucket("my-bucket")?;
+    /// // check if data is there
+    /// assert!(bucket.get_kv("some-key").is_some());
+    /// // delete the key / value pair
+    /// bucket.delete("some-key")?;
+    /// // data should no longer exist
+    /// assert!(bucket.get_kv("some-key").is_none());
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn delete<T: AsRef<[u8]>>(&self, key: T) -> Result<KVPair> {
+        let mut b = self.inner.borrow_mut();
+        if b.deleted {
+            panic!("Cannot delete data from a deleted bucket.");
+        }
+        Ok(b.delete(key)?.into())
+    }
+
+    /// Creates a new bucket.
+    ///
+    /// Returns an error if
+    /// 1. the given key already exists
+    /// 2. It is in a read-only transaction
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use jammdb::{DB};
+    /// # use jammdb::Error;
+    ///
+    /// # fn main() -> Result<(), Error> {
+    /// let db = DB::open("my.db")?;
+    /// let mut tx = db.rw()?;
+    ///
+    /// // create a root-level bucket
+    /// let bucket = tx.create_bucket("my-bucket")?;
+    ///
+    /// // create nested bucket
+    /// let mut sub_bucket = bucket.create_bucket("nested-bucket")?;
+    ///
+    /// // create nested bucket
+    /// let mut sub_sub_bucket = sub_bucket.create_bucket("double-nested-bucket")?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_bucket<'a, T: ToBytes<'tx>>(
+        &'a self,
+        name: T,
+    ) -> Result<Bucket<'b, 'tx, crate::tx::RwLock>> {
+        let mut b = self.inner.borrow_mut();
+        if b.deleted {
+            panic!("Cannot create bucket in a deleted bucket.");
+        }
+        let inner = b.create_bucket(name)?;
+        Ok(Bucket {
+            inner,
+            freelist: self.freelist.clone(),
+            _tx_type: self._tx_type,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Creates a new bucket if it doesn't exist
+    ///
+    /// Returns an error if
+    /// 1. It is in a read-only transaction
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use jammdb::{DB};
+    /// # use jammdb::Error;
+    ///
+    /// # fn main() -> Result<(), Error> {
+    /// let db = DB::open("my.db")?;
+    /// {
+    ///     let mut tx = db.rw()?;
+    ///     // create a root-level bucket
+    ///     let bucket = tx.get_or_create_bucket("my-bucket")?;
+    ///     tx.commit()?;
+    /// }
+    /// {
+    ///     let mut tx = db.rw()?;
+    ///     // get the existing a root-level bucket
+    ///     let bucket = tx.get_or_create_bucket("my-bucket")?;
+    /// }
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```    
+    pub fn get_or_create_bucket<'a, T: ToBytes<'tx>>(
+        &'a self,
+        name: T,
+    ) -> Result<Bucket<'b, 'tx, crate::tx::RwLock>> {
+        let mut b = self.inner.borrow_mut();
+        if b.deleted {
+            panic!("Cannot get or create bucket from a deleted bucket.");
+        }
+        let inner = b.get_or_create_bucket(name)?;
+        Ok(Bucket {
+            inner,
+            freelist: self.freelist.clone(),
+            _tx_type: self._tx_type,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Deletes an bucket.
+    ///
+    /// Returns an error if
+    /// 1. the given key does not exist
+    /// 2. the key is for key / value data, not a bucket
+    /// 3. It is in a read-only transaction
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use jammdb::{DB};
+    /// # use jammdb::Error;
+    ///
+    /// # fn main() -> Result<(), Error> {
+    /// let db = DB::open("my.db")?;
+    /// let mut tx = db.rw()?;
+    ///
+    /// // get a root-level bucket
+    /// let bucket = tx.get_bucket("my-bucket")?;
+    ///
+    /// // delete nested bucket
+    /// bucket.delete_bucket("nested-bucket")?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn delete_bucket<T: ToBytes<'tx>>(&self, key: T) -> Result<()> {
+        let mut freelist = self.freelist.borrow_mut();
+        let mut b = self.inner.borrow_mut();
+        if b.deleted {
+            panic!("Cannot delete bucket from a deleted bucket.");
+        }
+        b.delete_bucket(key, &mut freelist)
+    }
+}
+
 // and we'll implement IntoIterator
-impl<'b, 'tx> IntoIterator for Bucket<'b, 'tx> {
+impl<'b, 'tx, TxType: crate::tx::TxL> IntoIterator for Bucket<'b, 'tx, TxType> {
     type Item = Data<'b, 'tx>;
-    type IntoIter = Cursor<'b, 'tx>;
+    type IntoIter = Cursor<'b, 'tx, TxType>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.cursor()
     }
 }
 
-pub(crate) struct InnerBucket<'b> {
+pub(crate) struct InnerBucket<'b, TxType: crate::tx::TxL> {
     pub(crate) meta: BucketMeta,
     root: PageNodeID,
     pub(crate) deleted: bool,
     dirty: bool,
-    buckets: HashMap<Bytes<'b>, Rc<RefCell<InnerBucket<'b>>>>,
+    buckets: HashMap<Bytes<'b>, Rc<RefCell<InnerBucket<'b, TxType>>>>,
     pub(crate) nodes: Vec<Rc<RefCell<Node<'b>>>>,
     // Maps a PageID to it's NodeID, so we don't create multiple nodes for a single page
     page_node_ids: HashMap<PageID, NodeID>,
     // Maps PageIDs to their parent's PageID
     page_parents: HashMap<PageID, PageID>,
     pages: Pages,
+    pub(crate) _tx_type: PhantomData<TxType>,
 }
 
-impl<'b> InnerBucket<'b> {
-    pub(crate) fn from_meta(meta: BucketMeta, pages: Pages) -> InnerBucket<'b> {
+impl<'b, TxType: crate::tx::TxL> InnerBucket<'b, TxType> {
+    pub(crate) fn from_meta(meta: BucketMeta, pages: Pages) -> InnerBucket<'b, TxType> {
         debug_assert!(
             meta.root_page > 1,
             "bucket cannot have root page {}, reserved for meta",
@@ -489,28 +485,8 @@ impl<'b> InnerBucket<'b> {
             page_node_ids: HashMap::new(),
             page_parents: HashMap::new(),
             pages,
+            _tx_type: PhantomData::<TxType>,
         }
-    }
-
-    fn new_child<'a>(&'a mut self, name: Bytes<'b>) -> RefMut<InnerBucket<'b>> {
-        self.dirty = true;
-        let n = Node::new(0, Page::TYPE_LEAF, self.pages.pagesize);
-        let mut page_node_ids = HashMap::new();
-        page_node_ids.insert(0, 0);
-        let b = InnerBucket {
-            meta: BucketMeta::default(),
-            root: PageNodeID::Node(0),
-            deleted: false,
-            dirty: true,
-            buckets: HashMap::new(),
-            nodes: vec![Rc::new(RefCell::new(n))],
-            page_node_ids,
-            page_parents: HashMap::new(),
-            pages: self.pages.clone(),
-        };
-        self.buckets.insert(name.clone(), Rc::new(RefCell::new(b)));
-        let b = self.buckets.get_mut(&name).unwrap();
-        b.borrow_mut()
     }
 
     pub(crate) fn add_page_parent(&mut self, page: PageID, parent: PageID) {
@@ -546,118 +522,22 @@ impl<'b> InnerBucket<'b> {
         }
     }
 
-    pub fn put<'a, T: ToBytes<'b>, S: ToBytes<'b>>(
-        &'a mut self,
-        key: T,
-        value: S,
-    ) -> Result<Option<(Bytes<'b>, Bytes<'b>)>> {
-        let k = key.to_bytes();
-        let v = value.to_bytes();
-
-        match self.put_leaf(Leaf::Kv(k, v))? {
-            Some(data) => match data {
-                Leaf::Kv(k, v) => Ok(Some((k, v))),
-                _ => panic!("Unexpected data"),
-            },
-            None => Ok(None),
-        }
-    }
-
-    fn delete<'a, T: AsRef<[u8]>>(&'a mut self, key: T) -> Result<(Bytes<'b>, Bytes<'b>)> {
-        let (exists, stack) = search(key.as_ref(), self.meta.root_page, self);
-        let last = stack.last().unwrap();
-        if exists {
-            let page_node = self.page_node(last.id);
-            let data = page_node.val(last.index).unwrap();
-            if data.is_kv() {
-                let current_id = last.id;
-                let index = last.index;
-                self.dirty = true;
-                let node = self.node(current_id, None);
-                let mut node = node.borrow_mut();
-                match node.delete(index) {
-                    Leaf::Kv(k, v) => Ok((k, v)),
-                    _ => panic!("Unexpected data"),
-                }
-            } else {
-                Err(Error::IncompatibleValue)
-            }
-        } else {
-            Err(Error::KeyValueMissing)
-        }
-    }
-
-    fn put_leaf<'a>(&'a mut self, leaf: Leaf<'b>) -> Result<Option<Leaf<'b>>> {
-        let (exists, stack) = search(leaf.key(), self.meta.root_page, self);
-        let last = stack.last().unwrap();
-        let current_data = if exists {
-            let page_node = self.page_node(last.id);
-            let current = page_node.val(last.index).unwrap();
-            if current.is_kv() != leaf.is_kv() {
-                return Err(Error::IncompatibleValue);
-            }
-            Some(current)
-        } else {
-            self.meta.next_int += 1;
-            None
-        };
-        let node = self.node(last.id, None);
-        let mut node = node.borrow_mut();
-        node.insert_data(leaf);
-        self.dirty = true;
-
-        Ok(current_data)
-    }
-
-    pub(crate) fn create_bucket<T: ToBytes<'b>>(&mut self, name: T) -> Result<Rc<RefCell<Self>>> {
-        self.bucket_getter(name.to_bytes(), true, true)
-    }
-
     pub(crate) fn get_bucket<'a, T: ToBytes<'b>>(
         &'a mut self,
         name: T,
     ) -> Result<Rc<RefCell<Self>>> {
-        self.bucket_getter(name.to_bytes(), false, false)
-    }
+        let name = name.to_bytes();
 
-    pub(crate) fn get_or_create_bucket<T: ToBytes<'b>>(
-        &mut self,
-        name: T,
-    ) -> Result<Rc<RefCell<Self>>> {
-        self.bucket_getter(name.to_bytes(), true, false)
-    }
-
-    fn bucket_getter<'a>(
-        &'a mut self,
-        name: Bytes<'b>,
-        should_create: bool,
-        must_create: bool,
-    ) -> Result<Rc<RefCell<InnerBucket<'b>>>> {
         if !self.buckets.contains_key(&name) {
             let (exists, stack) = search(name.as_ref(), self.meta.root_page, self);
             let last = stack.last().unwrap();
             if !exists {
-                if should_create {
-                    self.meta.next_int += 1;
-                    let leaf = {
-                        let b = self.new_child(name.clone());
-                        let meta = b.meta;
-                        Leaf::Bucket(name.clone(), meta)
-                    };
-                    let node = self.node(last.id, None);
-                    let mut node = node.borrow_mut();
-                    node.insert_data(leaf);
-                } else {
-                    return Err(Error::BucketMissing);
-                }
+                return Err(Error::BucketMissing);
             } else {
                 let page_node = self.page_node(last.id);
                 match page_node.val(last.index) {
                     Some(leaf) => match leaf {
                         Leaf::Bucket(name, meta) => {
-                            if must_create {
-                                return Err(Error::BucketExists);
-                            }
                             let b = Self::from_meta(meta, self.pages.clone());
                             self.buckets.insert(name.clone(), Rc::new(RefCell::new(b)));
                         }
@@ -666,77 +546,8 @@ impl<'b> InnerBucket<'b> {
                     None => return Err(Error::BucketMissing),
                 }
             }
-        } else if must_create {
-            return Err(Error::BucketExists);
         }
         Ok(self.buckets.get(&name).unwrap().clone())
-    }
-
-    pub(crate) fn delete_bucket<T: ToBytes<'b>>(
-        &mut self,
-        name: T,
-        freelist: &mut TxFreelist,
-    ) -> Result<()> {
-        let name = name.to_bytes();
-        // make sure the bucket is in our map
-        self.get_bucket(&name)?;
-
-        // remove the bucket from the map so we won't have a reference to it anymore
-        let bucket = self.buckets.remove(&name).unwrap();
-        let mut b = bucket.borrow_mut();
-        // Mark it as deleted in case there is still a Bucket or cursor with a reference to this bucket.
-        b.deleted = true;
-        // check that the bucket wasn't just created and never comitted
-        let mut remaining_pages = Vec::new();
-        if b.meta.root_page != 0 {
-            // create a stack of pages to free and keep going until
-            // we've freed every reachable page starting from this bucket's root page
-            remaining_pages.push(b.meta.root_page);
-            while let Some(page_id) = remaining_pages.pop() {
-                let page = self.pages.page(page_id);
-                let num_pages = page.overflow + 1;
-                match page.page_type {
-                    // every branch element's page much be freed
-                    Page::TYPE_BRANCH => {
-                        page.branch_elements()
-                            .iter()
-                            .for_each(|b| remaining_pages.push(b.page));
-                    }
-                    Page::TYPE_LEAF => {
-                        // every nested bucket's pages must be freed
-                        page.leaf_elements().iter().for_each(|leaf| {
-                            if leaf.node_type == Node::TYPE_BUCKET {
-                                let meta: BucketMeta = leaf.value().into();
-                                remaining_pages.push(meta.root_page);
-                            }
-                        });
-                    }
-                    _ => (),
-                }
-                freelist.free(page_id, num_pages);
-            }
-        }
-        // delete the element from this bucket
-        let (exists, stack) = search(name.as_ref(), self.meta.root_page, self);
-        let last = stack.last().unwrap();
-        if exists {
-            let page_node = self.page_node(last.id);
-            let data = page_node.val(last.index).unwrap();
-
-            if !data.is_kv() {
-                self.dirty = true;
-                let current_id = last.id;
-                let index = last.index;
-                let node = self.node(current_id, None);
-                let mut node = node.borrow_mut();
-                node.delete(index);
-                Ok(())
-            } else {
-                Err(Error::IncompatibleValue)
-            }
-        } else {
-            panic!("Did not find data for bucket we already deleted")
-        }
     }
 
     pub(crate) fn node<'a>(
@@ -933,6 +744,216 @@ impl<'b> InnerBucket<'b> {
             }
         }
     }
+}
+
+impl<'b> InnerBucket<'b, crate::tx::RwLock<'b>> {
+    fn new_child<'a>(&'a mut self, name: Bytes<'b>) -> RefMut<InnerBucket<'b, crate::tx::RwLock>> {
+        self.dirty = true;
+        let n = Node::new(0, Page::TYPE_LEAF, self.pages.pagesize);
+        let mut page_node_ids = HashMap::new();
+        page_node_ids.insert(0, 0);
+        let b = InnerBucket {
+            meta: BucketMeta::default(),
+            root: PageNodeID::Node(0),
+            deleted: false,
+            dirty: true,
+            buckets: HashMap::new(),
+            nodes: vec![Rc::new(RefCell::new(n))],
+            page_node_ids,
+            page_parents: HashMap::new(),
+            pages: self.pages.clone(),
+            _tx_type: self._tx_type,
+        };
+        self.buckets.insert(name.clone(), Rc::new(RefCell::new(b)));
+        let b = self.buckets.get_mut(&name).unwrap();
+        b.borrow_mut()
+    }
+
+    pub fn put<'a, T: ToBytes<'b>, S: ToBytes<'b>>(
+        &'a mut self,
+        key: T,
+        value: S,
+    ) -> Result<Option<(Bytes<'b>, Bytes<'b>)>> {
+        let k = key.to_bytes();
+        let v = value.to_bytes();
+
+        match self.put_leaf(Leaf::Kv(k, v))? {
+            Some(data) => match data {
+                Leaf::Kv(k, v) => Ok(Some((k, v))),
+                _ => panic!("Unexpected data"),
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn delete<'a, T: AsRef<[u8]>>(&'a mut self, key: T) -> Result<(Bytes<'b>, Bytes<'b>)> {
+        let (exists, stack) = search(key.as_ref(), self.meta.root_page, self);
+        let last = stack.last().unwrap();
+        if exists {
+            let page_node = self.page_node(last.id);
+            let data = page_node.val(last.index).unwrap();
+            if data.is_kv() {
+                let current_id = last.id;
+                let index = last.index;
+                self.dirty = true;
+                let node = self.node(current_id, None);
+                let mut node = node.borrow_mut();
+                match node.delete(index) {
+                    Leaf::Kv(k, v) => Ok((k, v)),
+                    _ => panic!("Unexpected data"),
+                }
+            } else {
+                Err(Error::IncompatibleValue)
+            }
+        } else {
+            Err(Error::KeyValueMissing)
+        }
+    }
+
+    fn put_leaf<'a>(&'a mut self, leaf: Leaf<'b>) -> Result<Option<Leaf<'b>>> {
+        let (exists, stack) = search(leaf.key(), self.meta.root_page, self);
+        let last = stack.last().unwrap();
+        let current_data = if exists {
+            let page_node = self.page_node(last.id);
+            let current = page_node.val(last.index).unwrap();
+            if current.is_kv() != leaf.is_kv() {
+                return Err(Error::IncompatibleValue);
+            }
+            Some(current)
+        } else {
+            self.meta.next_int += 1;
+            None
+        };
+        let node = self.node(last.id, None);
+        let mut node = node.borrow_mut();
+        node.insert_data(leaf);
+        self.dirty = true;
+
+        Ok(current_data)
+    }
+
+    pub(crate) fn create_bucket<T: ToBytes<'b>>(&mut self, name: T) -> Result<Rc<RefCell<Self>>> {
+        self.bucket_getter(name.to_bytes(), true, true)
+    }
+
+    pub(crate) fn get_or_create_bucket<T: ToBytes<'b>>(
+        &mut self,
+        name: T,
+    ) -> Result<Rc<RefCell<Self>>> {
+        self.bucket_getter(name.to_bytes(), true, false)
+    }
+
+    fn bucket_getter<'a>(
+        &'a mut self,
+        name: Bytes<'b>,
+        should_create: bool,
+        must_create: bool,
+    ) -> Result<Rc<RefCell<InnerBucket<'b, crate::tx::RwLock>>>> {
+        if !self.buckets.contains_key(&name) {
+            let (exists, stack) = search(name.as_ref(), self.meta.root_page, self);
+            let last = stack.last().unwrap();
+            if !exists {
+                if should_create {
+                    self.meta.next_int += 1;
+                    let leaf = {
+                        let b = self.new_child(name.clone());
+                        let meta = b.meta;
+                        Leaf::Bucket(name.clone(), meta)
+                    };
+                    let node = self.node(last.id, None);
+                    let mut node = node.borrow_mut();
+                    node.insert_data(leaf);
+                } else {
+                    return Err(Error::BucketMissing);
+                }
+            } else {
+                let page_node = self.page_node(last.id);
+                match page_node.val(last.index) {
+                    Some(leaf) => match leaf {
+                        Leaf::Bucket(name, meta) => {
+                            if must_create {
+                                return Err(Error::BucketExists);
+                            }
+                            let b = Self::from_meta(meta, self.pages.clone());
+                            self.buckets.insert(name.clone(), Rc::new(RefCell::new(b)));
+                        }
+                        _ => return Err(Error::IncompatibleValue),
+                    },
+                    None => return Err(Error::BucketMissing),
+                }
+            }
+        } else if must_create {
+            return Err(Error::BucketExists);
+        }
+        Ok(self.buckets.get(&name).unwrap().clone())
+    }
+
+    pub(crate) fn delete_bucket<T: ToBytes<'b>>(
+        &mut self,
+        name: T,
+        freelist: &mut TxFreelist,
+    ) -> Result<()> {
+        let name = name.to_bytes();
+        // make sure the bucket is in our map
+        self.get_bucket(&name)?;
+
+        // remove the bucket from the map so we won't have a reference to it anymore
+        let bucket = self.buckets.remove(&name).unwrap();
+        let mut b = bucket.borrow_mut();
+        // Mark it as deleted in case there is still a Bucket or cursor with a reference to this bucket.
+        b.deleted = true;
+        // check that the bucket wasn't just created and never comitted
+        let mut remaining_pages = Vec::new();
+        if b.meta.root_page != 0 {
+            // create a stack of pages to free and keep going until
+            // we've freed every reachable page starting from this bucket's root page
+            remaining_pages.push(b.meta.root_page);
+            while let Some(page_id) = remaining_pages.pop() {
+                let page = self.pages.page(page_id);
+                let num_pages = page.overflow + 1;
+                match page.page_type {
+                    // every branch element's page much be freed
+                    Page::TYPE_BRANCH => {
+                        page.branch_elements()
+                            .iter()
+                            .for_each(|b| remaining_pages.push(b.page));
+                    }
+                    Page::TYPE_LEAF => {
+                        // every nested bucket's pages must be freed
+                        page.leaf_elements().iter().for_each(|leaf| {
+                            if leaf.node_type == Node::TYPE_BUCKET {
+                                let meta: BucketMeta = leaf.value().into();
+                                remaining_pages.push(meta.root_page);
+                            }
+                        });
+                    }
+                    _ => (),
+                }
+                freelist.free(page_id, num_pages);
+            }
+        }
+        // delete the element from this bucket
+        let (exists, stack) = search(name.as_ref(), self.meta.root_page, self);
+        let last = stack.last().unwrap();
+        if exists {
+            let page_node = self.page_node(last.id);
+            let data = page_node.val(last.index).unwrap();
+
+            if !data.is_kv() {
+                self.dirty = true;
+                let current_id = last.id;
+                let index = last.index;
+                let node = self.node(current_id, None);
+                let mut node = node.borrow_mut();
+                node.delete(index);
+                Ok(())
+            } else {
+                Err(Error::IncompatibleValue)
+            }
+        } else {
+            panic!("Did not find data for bucket we already deleted")
+        }
+    }
 
     // Make sure none of the nodes are too full, creating other nodes as needed.
     // Then, write all of those nodes to dirty pages.
@@ -1026,7 +1047,7 @@ mod tests {
     		fn $name() {
                 let random_file = RandomFile::new();
                 let db = DB::open(&random_file).unwrap();
-                let tx = db.tx(true).unwrap();
+                let tx = db.rw().unwrap();
                 let b = tx.create_bucket("abc").unwrap();
                 tx.delete_bucket("abc").unwrap();
                 #[allow(clippy::redundant_closure_call)]
@@ -1037,40 +1058,40 @@ mod tests {
     }
 
     deleted_bucket_test! {
-        deleted_bucket_put: ("Cannot put data into a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_put: ("Cannot put data into a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.put("a", "b");
         })
-        deleted_bucket_get: ("Cannot get data from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_get: ("Cannot get data from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             b.get("a");
         })
-        deleted_bucket_delete: ("Cannot delete data from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_delete: ("Cannot delete data from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.delete("a");
         })
-        deleted_bucket_get_kv: ("Cannot get data from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_get_kv: ("Cannot get data from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             b.get_kv("a");
         })
-        deleted_bucket_get_bucket: ("Cannot get bucket from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_get_bucket: ("Cannot get bucket from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.get_bucket("a");
         })
-        deleted_bucket_create_bucket: ("Cannot create bucket in a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_create_bucket: ("Cannot create bucket in a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.create_bucket("a");
         })
-        deleted_bucket_get_or_create_bucket: ("Cannot get or create bucket from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_get_or_create_bucket: ("Cannot get or create bucket from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.get_or_create_bucket("a");
         })
-        deleted_bucket_delete_bucket: ("Cannot delete bucket from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_delete_bucket: ("Cannot delete bucket from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.delete_bucket("a");
         })
-        deleted_bucket_next_int: ("Cannot get next int from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_next_int: ("Cannot get next int from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             b.next_int();
         })
-        deleted_bucket_cursor: ("Cannot create cursor from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_cursor: ("Cannot create cursor from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             b.cursor();
         })
-        deleted_bucket_buckets: ("Cannot create cursor from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_buckets: ("Cannot create cursor from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.buckets();
         })
-        deleted_bucket_kv_pairs: ("Cannot create cursor from a deleted bucket.", |b: &Bucket| {
+        deleted_bucket_kv_pairs: ("Cannot create cursor from a deleted bucket.", |b: &Bucket<crate::tx::RwLock>| {
             let _ = b.kv_pairs();
         })
     }
@@ -1084,7 +1105,7 @@ mod tests {
                 let db = DB::open(&random_file)?;
                 {
 
-                    let tx = db.tx(true)?;
+                    let tx = db.rw()?;
                     tx.create_bucket("abc")?;
                     tx.commit()?;
                 }
@@ -1099,27 +1120,6 @@ mod tests {
     }
 
     bucket_errors! {
-        ro_tx_put_data: (false, |b: &Bucket| {
-            assert_eq!(b.put("abc", "def").expect_err("Expected a ReadOnlyTx error"), Error::ReadOnlyTx);
-        })
-        ro_tx_delete_data: (false, |b: &Bucket| {
-            assert_eq!(b.delete("abc").expect_err("Expected a ReadOnlyTx error"), Error::ReadOnlyTx);
-        })
-        ro_tx_delete_bucket: (false, |b: &Bucket| {
-            assert_eq!(b.delete_bucket("abc").expect_err("Expected a ReadOnlyTx error"), Error::ReadOnlyTx);
-        })
-        ro_tx_get_or_create_bucket: (false, |b: &Bucket| {
-            match b.get_or_create_bucket("abc")  {
-                Ok(_) => panic!("Expected a ReadOnlyTx error"),
-                Err(e) => assert!(e == Error::ReadOnlyTx)
-            }
-        })
-        ro_tx_create_bucket: (false, |b: &Bucket| {
-            match b.create_bucket("abc")  {
-                Ok(_) => panic!("Expected a ReadOnlyTx error"),
-                Err(e) => assert!(e == Error::ReadOnlyTx)
-            }
-        })
         double_create_bucket: (true, |b: &Bucket| {
             b.create_bucket("abc").unwrap();
             match  b.create_bucket("abc") {
@@ -1165,7 +1165,7 @@ mod tests {
         let random_file = RandomFile::new();
         let db = DB::open(&random_file)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("abc")?;
             b.put("a", "1")?;
             b.put("b", "2")?;
@@ -1177,7 +1177,7 @@ mod tests {
         }
         macro_rules! iter_test {
             ($range:expr, $keys:expr) => {
-                let tx = db.tx(false)?;
+                let tx = db.ro()?;
                 let b = tx.get_bucket("abc")?;
                 let mut bucket_iter = b.range($range);
                 for k in $keys {

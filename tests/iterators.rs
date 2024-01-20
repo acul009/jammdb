@@ -123,7 +123,7 @@ fn cursor_seek() -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("abc")?;
             {
                 let mut random_fruits = Vec::from(fruits.as_slice());
@@ -139,7 +139,7 @@ fn cursor_seek() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(false)?;
+            let tx = db.ro()?;
             let b = tx.get_bucket("abc")?;
             check_cursor_starts(&fruits, &b);
         }
@@ -149,17 +149,17 @@ fn cursor_seek() -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(false)?;
+            let tx = db.ro()?;
             let b = tx.get_bucket("abc")?;
             check_cursor_starts(&fruits, &b);
         }
         {
-            let tx = db.tx(false)?;
+            let tx = db.ro()?;
             let b = tx.get_bucket("abc")?;
             check_cursor("bl", &fruits[6..], &b, 6);
         }
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.get_bucket("abc")?;
             b.put("zomato", fruits.len().to_string())?;
             fruits.push("zomato");
@@ -167,7 +167,7 @@ fn cursor_seek() -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(false)?;
+            let tx = db.ro()?;
             let b = tx.get_bucket("abc")?;
             check_cursor("bl", &fruits[6..], &b, 6);
         }
@@ -218,7 +218,7 @@ fn root_buckets() -> Result<(), Error> {
     {
         let db = OpenOptions::new().strict_mode(true).open(&random_file)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             {
                 let b = tx.create_bucket("abc")?;
                 b.put("data", "one")?;
@@ -233,7 +233,7 @@ fn root_buckets() -> Result<(), Error> {
             }
             tx.commit()?;
         }
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         for (i, (data, bucket)) in tx.buckets().enumerate() {
             let name = std::str::from_utf8(data.name()).unwrap();
             let kv = bucket.get_kv("data").unwrap();
@@ -262,7 +262,7 @@ fn kv_iter() -> Result<(), Error> {
     {
         let db = OpenOptions::new().strict_mode(true).open(&random_file)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             {
                 let b = tx.create_bucket("data")?;
                 for (k, v) in data.iter() {
@@ -271,7 +271,7 @@ fn kv_iter() -> Result<(), Error> {
             }
             tx.commit()?;
         }
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         let b = tx.get_bucket("data")?;
         for ((k, v), kvpair) in data.into_iter().zip(b.kv_pairs()) {
             assert_eq!(k.as_bytes(), kvpair.key());

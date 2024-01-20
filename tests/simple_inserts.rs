@@ -41,7 +41,7 @@ fn test_insert(mut values: Vec<u64>) -> Result<(), Error> {
             .strict_mode(true)
             .open(&random_file.path)?;
         {
-            let tx = db.tx(true)?;
+            let tx = db.rw()?;
             let b = tx.create_bucket("abc")?;
             // insert data in a random order
             values.shuffle(&mut rng);
@@ -55,7 +55,7 @@ fn test_insert(mut values: Vec<u64>) -> Result<(), Error> {
             tx.commit()?;
         }
         {
-            let tx = db.tx(false)?;
+            let tx = db.ro()?;
             let b = tx.get_bucket("abc")?;
             // check after commit before closing file
             check_data(&b, values.len() as u64, 1);
@@ -64,7 +64,7 @@ fn test_insert(mut values: Vec<u64>) -> Result<(), Error> {
     }
     {
         let db = DB::open(&random_file.path)?;
-        let tx = db.tx(false)?;
+        let tx = db.ro()?;
         let b = tx.get_bucket("abc")?;
         // check after re-opening file
         check_data(&b, values.len() as u64, 1);
