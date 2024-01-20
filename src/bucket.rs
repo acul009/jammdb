@@ -71,14 +71,14 @@ use crate::{
 /// That means it is possible to obtain a reference to a bucket, then delete that bucket from the parent. Do not do this.
 /// If you try to use a bucket that has been deleted it will panic, and nobody wants that 🙃.
 /// The same is true for any iterator over a bucket as well, like a [`Cursor`], [`Buckets`], or [`KVPairs`].
-pub struct Bucket<'b, 'tx: 'b, TxType: crate::tx::TxL> {
+pub struct Bucket<'b, 'tx: 'b, TxType: crate::tx::TxLock> {
     pub(crate) inner: Rc<RefCell<InnerBucket<'tx, TxType>>>,
     pub(crate) freelist: Rc<RefCell<TxFreelist>>,
     pub(crate) _tx_type: PhantomData<TxType>,
     pub(crate) _phantom: PhantomData<&'b ()>,
 }
 
-impl<'b, 'tx, TxType: crate::tx::TxL> Bucket<'b, 'tx, TxType> {
+impl<'b, 'tx, TxType: crate::tx::TxLock> Bucket<'b, 'tx, TxType> {
     pub fn get<'a, T: AsRef<[u8]>>(&'a self, key: T) -> Option<Data<'b, 'tx>> {
         let mut b = self.inner.borrow_mut();
         if b.deleted {
@@ -345,7 +345,7 @@ impl<'b, 'tx> Bucket<'b, 'tx, crate::tx::RwLock<'tx>> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_bucket<'a, T: ToBytes<'tx>>(
+    pub fn create_bucket<'a: 'tx, T: ToBytes<'tx>>(
         &'a self,
         name: T,
     ) -> Result<Bucket<'b, 'tx, crate::tx::RwLock>> {
@@ -390,7 +390,7 @@ impl<'b, 'tx> Bucket<'b, 'tx, crate::tx::RwLock<'tx>> {
     /// # Ok(())
     /// # }
     /// ```    
-    pub fn get_or_create_bucket<'a, T: ToBytes<'tx>>(
+    pub fn get_or_create_bucket<'a: 'tx, T: ToBytes<'tx>>(
         &'a self,
         name: T,
     ) -> Result<Bucket<'b, 'tx, crate::tx::RwLock>> {
@@ -444,7 +444,7 @@ impl<'b, 'tx> Bucket<'b, 'tx, crate::tx::RwLock<'tx>> {
 }
 
 // and we'll implement IntoIterator
-impl<'b, 'tx, TxType: crate::tx::TxL> IntoIterator for Bucket<'b, 'tx, TxType> {
+impl<'b, 'tx, TxType: crate::tx::TxLock> IntoIterator for Bucket<'b, 'tx, TxType> {
     type Item = Data<'b, 'tx>;
     type IntoIter = Cursor<'b, 'tx, TxType>;
 
@@ -453,7 +453,7 @@ impl<'b, 'tx, TxType: crate::tx::TxL> IntoIterator for Bucket<'b, 'tx, TxType> {
     }
 }
 
-pub(crate) struct InnerBucket<'b, TxType: crate::tx::TxL> {
+pub(crate) struct InnerBucket<'b, TxType: crate::tx::TxLock> {
     pub(crate) meta: BucketMeta,
     root: PageNodeID,
     pub(crate) deleted: bool,
@@ -468,7 +468,7 @@ pub(crate) struct InnerBucket<'b, TxType: crate::tx::TxL> {
     pub(crate) _tx_type: PhantomData<TxType>,
 }
 
-impl<'b, TxType: crate::tx::TxL> InnerBucket<'b, TxType> {
+impl<'b, TxType: crate::tx::TxLock> InnerBucket<'b, TxType> {
     pub(crate) fn from_meta(meta: BucketMeta, pages: Pages) -> InnerBucket<'b, TxType> {
         debug_assert!(
             meta.root_page > 1,
@@ -747,7 +747,10 @@ impl<'b, TxType: crate::tx::TxL> InnerBucket<'b, TxType> {
 }
 
 impl<'b> InnerBucket<'b, crate::tx::RwLock<'b>> {
-    fn new_child<'a>(&'a mut self, name: Bytes<'b>) -> RefMut<InnerBucket<'b, crate::tx::RwLock>> {
+    fn new_child<'a: 'b>(
+        &'a mut self,
+        name: Bytes<'b>,
+    ) -> RefMut<InnerBucket<'b, crate::tx::RwLock>> {
         self.dirty = true;
         let n = Node::new(0, Page::TYPE_LEAF, self.pages.pagesize);
         let mut page_node_ids = HashMap::new();
@@ -833,39 +836,34 @@ impl<'b> InnerBucket<'b, crate::tx::RwLock<'b>> {
     }
 
     pub(crate) fn create_bucket<T: ToBytes<'b>>(&mut self, name: T) -> Result<Rc<RefCell<Self>>> {
-        self.bucket_getter(name.to_bytes(), true, true)
+        self.bucket_getter(name.to_bytes(), true)
     }
 
     pub(crate) fn get_or_create_bucket<T: ToBytes<'b>>(
         &mut self,
         name: T,
     ) -> Result<Rc<RefCell<Self>>> {
-        self.bucket_getter(name.to_bytes(), true, false)
+        self.bucket_getter(name.to_bytes(), false)
     }
 
-    fn bucket_getter<'a>(
+    fn bucket_getter<'a: 'b>(
         &'a mut self,
         name: Bytes<'b>,
-        should_create: bool,
         must_create: bool,
     ) -> Result<Rc<RefCell<InnerBucket<'b, crate::tx::RwLock>>>> {
         if !self.buckets.contains_key(&name) {
             let (exists, stack) = search(name.as_ref(), self.meta.root_page, self);
             let last = stack.last().unwrap();
             if !exists {
-                if should_create {
-                    self.meta.next_int += 1;
-                    let leaf = {
-                        let b = self.new_child(name.clone());
-                        let meta = b.meta;
-                        Leaf::Bucket(name.clone(), meta)
-                    };
-                    let node = self.node(last.id, None);
-                    let mut node = node.borrow_mut();
-                    node.insert_data(leaf);
-                } else {
-                    return Err(Error::BucketMissing);
-                }
+                self.meta.next_int += 1;
+                let leaf = {
+                    let b = self.new_child(name.clone());
+                    let meta = b.meta;
+                    Leaf::Bucket(name.clone(), meta)
+                };
+                let node = self.node(last.id, None);
+                let mut node = node.borrow_mut();
+                node.insert_data(leaf);
             } else {
                 let page_node = self.page_node(last.id);
                 match page_node.val(last.index) {
@@ -1097,7 +1095,7 @@ mod tests {
     }
 
     macro_rules! bucket_errors {
-    	($($name:ident: ($rw: expr, $value:expr))*) => {
+    	($($name:ident: ($value:expr))*) => {
     	$(
     		#[test]
     		fn $name() -> Result<()> {
@@ -1109,7 +1107,8 @@ mod tests {
                     tx.create_bucket("abc")?;
                     tx.commit()?;
                 }
-                let tx = db.tx($rw)?;
+                let tx = db.rw()?;
+                // let tx = db.tx($rw)?;
                 let b = tx.get_bucket("abc")?;
                 #[allow(clippy::redundant_closure_call)]
                 $value(&b);
@@ -1120,7 +1119,7 @@ mod tests {
     }
 
     bucket_errors! {
-        double_create_bucket: (true, |b: &Bucket<crate::tx::RwLock>| {
+        double_create_bucket: ( |b: &Bucket<crate::tx::RwLock>| {
             b.create_bucket("abc").unwrap();
             match  b.create_bucket("abc") {
                 Ok(_) => panic!("Expected a BucketExists error"),

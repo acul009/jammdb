@@ -55,7 +55,7 @@ use crate::{
 /// # Ok(())
 /// # }
 /// ```
-pub struct Cursor<'b, 'tx, TxType: crate::tx::TxL> {
+pub struct Cursor<'b, 'tx, TxType: crate::tx::TxLock> {
     bucket: Rc<RefCell<InnerBucket<'tx, TxType>>>,
     freelist: Rc<RefCell<TxFreelist>>,
     stack: Vec<SearchPath>,
@@ -64,7 +64,7 @@ pub struct Cursor<'b, 'tx, TxType: crate::tx::TxL> {
     _tx_type: PhantomData<TxType>,
 }
 
-impl<'b, 'tx, TxType: crate::tx::TxL> Cursor<'b, 'tx, TxType> {
+impl<'b, 'tx, TxType: crate::tx::TxLock> Cursor<'b, 'tx, TxType> {
     pub(crate) fn new(b: &Bucket<'b, 'tx, TxType>) -> Cursor<'b, 'tx, TxType> {
         Cursor {
             bucket: b.inner.clone(),
@@ -136,7 +136,7 @@ impl<'b, 'tx, TxType: crate::tx::TxL> Cursor<'b, 'tx, TxType> {
 }
 
 // function that searches the bucket for a given key
-pub(crate) fn search<TxType: crate::tx::TxL>(
+pub(crate) fn search<TxType: crate::tx::TxLock>(
     key: &[u8],
     mut page_id: PageID,
     b: &mut InnerBucket<TxType>,
@@ -166,7 +166,7 @@ pub(crate) struct SearchPath {
     pub(crate) id: PageNodeID,
 }
 
-impl<'b, 'tx, TxType: crate::tx::TxL> Iterator for Cursor<'b, 'tx, TxType> {
+impl<'b, 'tx, TxType: crate::tx::TxLock> Iterator for Cursor<'b, 'tx, TxType> {
     type Item = Data<'b, 'tx>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -201,7 +201,7 @@ impl<'b, 'tx, TxType: crate::tx::TxL> Iterator for Cursor<'b, 'tx, TxType> {
 }
 
 /// A bounded iterator over the data in a bucket.
-pub struct Range<'r, 'b, 'tx, R, TxType: crate::tx::TxL>
+pub struct Range<'r, 'b, 'tx, R, TxType: crate::tx::TxLock>
 where
     R: RangeBounds<&'r [u8]>,
 {
@@ -210,7 +210,7 @@ where
     pub(crate) _phantom: PhantomData<&'r ()>,
 }
 
-impl<'r, 'b, 'tx, R, TxType: crate::tx::TxL> Iterator for Range<'r, 'b, 'tx, R, TxType>
+impl<'r, 'b, 'tx, R, TxType: crate::tx::TxLock> Iterator for Range<'r, 'b, 'tx, R, TxType>
 where
     R: RangeBounds<&'r [u8]>,
 {
@@ -256,7 +256,7 @@ where
 }
 
 /// An iterator over a bucket's sub-buckets.
-pub struct Buckets<'b, 'tx, I, TxType: crate::tx::TxL> {
+pub struct Buckets<'b, 'tx, I, TxType: crate::tx::TxLock> {
     pub(crate) i: I,
     pub(crate) bucket: Rc<RefCell<InnerBucket<'tx, TxType>>>,
     pub(crate) freelist: Rc<RefCell<TxFreelist>>,
@@ -264,7 +264,7 @@ pub struct Buckets<'b, 'tx, I, TxType: crate::tx::TxL> {
     pub(crate) _tx_type: PhantomData<TxType>,
 }
 
-impl<'b, 'tx: 'b, I, TxType: crate::tx::TxL> Iterator for Buckets<'b, 'tx, I, TxType>
+impl<'b, 'tx: 'b, I, TxType: crate::tx::TxLock> Iterator for Buckets<'b, 'tx, I, TxType>
 where
     I: Iterator<Item = Data<'b, 'tx>>,
 {
@@ -293,13 +293,15 @@ where
     }
 }
 
-pub trait ToBuckets<'b, 'tx: 'b, TxType: crate::tx::TxL>:
+pub trait ToBuckets<'b, 'tx: 'b, TxType: crate::tx::TxLock>:
     Iterator<Item = Data<'b, 'tx>> + Sized
 {
     fn to_buckets(self) -> Buckets<'b, 'tx, Self, TxType>;
 }
 
-impl<'b, 'tx: 'b, TxType: crate::tx::TxL> ToBuckets<'b, 'tx, TxType> for Cursor<'b, 'tx, TxType> {
+impl<'b, 'tx: 'b, TxType: crate::tx::TxLock> ToBuckets<'b, 'tx, TxType>
+    for Cursor<'b, 'tx, TxType>
+{
     fn to_buckets(self) -> Buckets<'b, 'tx, Self, TxType> {
         let freelist = self.freelist.clone();
         let bucket = self.bucket.clone();
@@ -313,7 +315,7 @@ impl<'b, 'tx: 'b, TxType: crate::tx::TxL> ToBuckets<'b, 'tx, TxType> for Cursor<
     }
 }
 
-impl<'r, 'b, 'tx: 'b, R, TxType: crate::tx::TxL> ToBuckets<'b, 'tx, TxType>
+impl<'r, 'b, 'tx: 'b, R, TxType: crate::tx::TxLock> ToBuckets<'b, 'tx, TxType>
     for Range<'r, 'b, 'tx, R, TxType>
 where
     R: RangeBounds<&'r [u8]>,
@@ -356,13 +358,13 @@ pub trait ToKVPairs<'b, 'tx>: Iterator<Item = Data<'b, 'tx>> + Sized {
     fn to_kv_pairs(self) -> KVPairs<Self>;
 }
 
-impl<'b, 'tx, TxType: crate::tx::TxL> ToKVPairs<'b, 'tx> for Cursor<'b, 'tx, TxType> {
+impl<'b, 'tx, TxType: crate::tx::TxLock> ToKVPairs<'b, 'tx> for Cursor<'b, 'tx, TxType> {
     fn to_kv_pairs(self) -> KVPairs<Self> {
         KVPairs { i: self }
     }
 }
 
-impl<'r, 'b, 'tx, R, TxType: crate::tx::TxL> ToKVPairs<'b, 'tx> for Range<'r, 'b, 'tx, R, TxType>
+impl<'r, 'b, 'tx, R, TxType: crate::tx::TxLock> ToKVPairs<'b, 'tx> for Range<'r, 'b, 'tx, R, TxType>
 where
     R: RangeBounds<&'r [u8]>,
 {

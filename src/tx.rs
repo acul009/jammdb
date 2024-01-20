@@ -22,20 +22,6 @@ use crate::{
     BucketName,
 };
 
-pub(crate) enum TxLock<'tx> {
-    Rw(MutexGuard<'tx, File>),
-    Ro(RwLockReadGuard<'tx, ()>),
-}
-
-impl<'tx> TxLock<'tx> {
-    fn writable(&self) -> bool {
-        match self {
-            Self::Rw(_) => true,
-            Self::Ro(_) => false,
-        }
-    }
-}
-
 /// An isolated view of the database
 ///
 /// Transactions are how you can interact with the database.
@@ -95,29 +81,29 @@ impl<'tx> TxLock<'tx> {
 /// <sup>2</sup> Keep in mind that long running read-only transactions will prevent the database from
 /// reclaiming old pages and your database may increase in disk size quickly if you're writing lots of data,
 /// so it's a good idea to keep transactions short.
-pub struct Tx<'tx, Lock: TxL> {
+pub struct Tx<'tx, Lock: TxLock> {
     pub(crate) inner: RefCell<TxInner<'tx, Lock>>,
 }
 
 pub(crate) type RwLock<'tx> = MutexGuard<'tx, File>;
-impl<'tx> TxL for RwLock<'tx> {
+impl<'tx> TxLock for RwLock<'tx> {
     fn writeable(&self) -> bool {
         true
     }
 }
 
 pub(crate) type RoLock<'tx> = RwLockReadGuard<'tx, ()>;
-impl<'tx> TxL for RoLock<'tx> {
+impl<'tx> TxLock for RoLock<'tx> {
     fn writeable(&self) -> bool {
         false
     }
 }
 
-pub(crate) trait TxL {
+pub(crate) trait TxLock {
     fn writeable(&self) -> bool;
 }
 
-pub(crate) struct TxInner<'tx, Lock: TxL> {
+pub(crate) struct TxInner<'tx, Lock: TxLock> {
     pub(crate) db: &'tx DB,
     pub(crate) lock: Lock,
     pub(crate) root: Rc<RefCell<InnerBucket<'tx, Lock>>>,
@@ -167,7 +153,7 @@ impl<'tx> Tx<'tx, RoLock<'tx>> {
     }
 }
 
-impl<'tx, Lock: TxL> Tx<'tx, Lock> {
+impl<'tx, Lock: TxLock> Tx<'tx, Lock> {
     fn new_helper(
         db: &'tx DB,
         lock: Lock,
@@ -240,7 +226,7 @@ impl<'tx> Tx<'tx, RwLock<'tx>> {
     /// Will return a [`BucketExists`](enum.Error.html#variant.BucketExists) error if the bucket already exists,
     /// an [`IncompatibleValue`](enum.Error.html#variant.IncompatibleValue) error if the key exists but is not a bucket,
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
-    pub fn create_bucket<'b, T: ToBytes<'tx>>(
+    pub fn create_bucket<'b: 'tx, T: ToBytes<'tx>>(
         &'b self,
         name: T,
     ) -> Result<Bucket<'b, 'tx, RwLock>> {
@@ -262,7 +248,7 @@ impl<'tx> Tx<'tx, RwLock<'tx>> {
     ///
     /// Will return an [`IncompatibleValue`](enum.Error.html#variant.IncompatibleValue) error if the key exists but is not a bucket,
     /// or a [`ReadOnlyTx`](enum.Error.html#variant.ReadOnlyTx) error if this is called on a read-only transaction.
-    pub fn get_or_create_bucket<'b, T: ToBytes<'tx>>(
+    pub fn get_or_create_bucket<'b: 'tx, T: ToBytes<'tx>>(
         &'b self,
         name: T,
     ) -> Result<Bucket<'b, 'tx, RwLock>> {
@@ -312,7 +298,7 @@ impl<'tx> Tx<'tx, RwLock<'tx>> {
     }
 }
 
-impl<'tx, Lock: TxL> TxInner<'tx, Lock> {
+impl<'tx, Lock: TxLock> TxInner<'tx, Lock> {
     fn check(&self) -> Result<()> {
         let mut unused_pages: HashSet<PageID> = (2..self.meta.num_pages).collect();
         let mut page_stack = Vec::new();
@@ -433,80 +419,85 @@ impl<'tx, Lock: TxL> TxInner<'tx, Lock> {
 
 impl<'tx> TxInner<'tx, RwLock<'tx>> {
     fn write_data(&mut self, freelist: &mut TxFreelist) -> Result<()> {
-        let file = &mut self.lock;
-        // Write the freelist to a new page
         {
-            freelist.free(self.meta.freelist_page, self.num_freelist_pages);
-            let freelist_size = freelist.inner.size();
-            let page = freelist.allocate(freelist_size)?;
-            self.meta.freelist_page = page.id;
-            let free_page_ids = freelist.inner.pages();
-            page.page_type = Page::TYPE_FREELIST;
-            page.count = free_page_ids.len() as u64;
-            page.freelist_mut()
-                .copy_from_slice(free_page_ids.as_slice());
-        }
+            let file = &mut self.lock;
+            // Write the freelist to a new page
+            {
+                freelist.free(self.meta.freelist_page, self.num_freelist_pages);
+                let freelist_size = freelist.inner.size();
+                let page = freelist.allocate(freelist_size)?;
+                self.meta.freelist_page = page.id;
+                let free_page_ids = freelist.inner.pages();
+                page.page_type = Page::TYPE_FREELIST;
+                page.count = free_page_ids.len() as u64;
+                page.freelist_mut()
+                    .copy_from_slice(free_page_ids.as_slice());
+            }
 
-        // Update our num_pages from the freelist now that we've allocated everything
-        self.meta.num_pages = freelist.meta.num_pages;
+            // Update our num_pages from the freelist now that we've allocated everything
+            self.meta.num_pages = freelist.meta.num_pages;
 
-        // Grow the file, if needed
-        let required_size = self.meta.num_pages * self.db.inner.pagesize;
-        let current_size = file.metadata()?.len();
-        if current_size < required_size {
-            let size_diff = required_size - current_size;
-            let alloc_size = ((size_diff / MIN_ALLOC_SIZE) + 1) * MIN_ALLOC_SIZE;
-            let data = self.db.inner.resize(file, current_size + alloc_size)?;
-            self.pages = Pages::new(data, self.db.inner.pagesize);
-        }
+            // Grow the file, if needed
+            let required_size = self.meta.num_pages * self.db.inner.pagesize;
+            let current_size = file.metadata()?.len();
+            if current_size < required_size {
+                let size_diff = required_size - current_size;
+                let alloc_size = ((size_diff / MIN_ALLOC_SIZE) + 1) * MIN_ALLOC_SIZE;
+                let data = self.db.inner.resize(file, current_size + alloc_size)?;
+                self.pages = Pages::new(data, self.db.inner.pagesize);
+            }
 
-        // write the data to the file
-        {
-            // freelist.pages is a BTreeMap so we're writing the pages in order to minmize
-            // the random seeks.
-            for (page_id, (ptr, size)) in freelist.pages.iter() {
-                let buf = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *size) };
-                file.seek(SeekFrom::Start(self.db.inner.pagesize * page_id))?;
-                file.write_all(buf)?;
+            // write the data to the file
+            {
+                // freelist.pages is a BTreeMap so we're writing the pages in order to minmize
+                // the random seeks.
+                for (page_id, (ptr, size)) in freelist.pages.iter() {
+                    let buf = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *size) };
+                    file.seek(SeekFrom::Start(self.db.inner.pagesize * page_id))?;
+                    file.write_all(buf)?;
+                }
             }
         }
         if self.db.inner.flags.strict_mode {
             self.check()?;
         }
-        // write meta page to file
         {
-            let mut buf = vec![0; self.db.inner.pagesize as usize];
+            let file = &mut self.lock;
+            // write meta page to file
+            {
+                let mut buf = vec![0; self.db.inner.pagesize as usize];
 
-            #[allow(clippy::cast_ptr_alignment)]
-            let page = unsafe { &mut *(&mut buf[0] as *mut u8 as *mut Page) };
-            let meta_page_id = u64::from(self.meta.meta_page == 0);
-            page.id = meta_page_id;
-            page.page_type = Page::TYPE_META;
-            let m = page.meta_mut();
-            m.meta_page = meta_page_id as u32;
-            m.magic = self.meta.magic;
-            m.version = self.meta.version;
-            m.pagesize = self.meta.pagesize;
-            m.root = self.meta.root;
-            m.num_pages = self.meta.num_pages;
-            m.freelist_page = self.meta.freelist_page;
-            m.tx_id = self.meta.tx_id;
-            m.hash = m.hash_self();
+                #[allow(clippy::cast_ptr_alignment)]
+                let page = unsafe { &mut *(&mut buf[0] as *mut u8 as *mut Page) };
+                let meta_page_id = u64::from(self.meta.meta_page == 0);
+                page.id = meta_page_id;
+                page.page_type = Page::TYPE_META;
+                let m = page.meta_mut();
+                m.meta_page = meta_page_id as u32;
+                m.magic = self.meta.magic;
+                m.version = self.meta.version;
+                m.pagesize = self.meta.pagesize;
+                m.root = self.meta.root;
+                m.num_pages = self.meta.num_pages;
+                m.freelist_page = self.meta.freelist_page;
+                m.tx_id = self.meta.tx_id;
+                m.hash = m.hash_self();
 
-            file.seek(SeekFrom::Start(self.db.inner.pagesize * meta_page_id))?;
-            file.write_all(buf.as_slice())?;
+                file.seek(SeekFrom::Start(self.db.inner.pagesize * meta_page_id))?;
+                file.write_all(buf.as_slice())?;
+            }
+
+            file.flush()?;
+            file.sync_all()?;
+
+            let mut lock = self.db.inner.freelist.lock()?;
+            *lock = freelist.inner.clone();
+            Ok(())
         }
-
-        file.flush()?;
-        file.sync_all()?;
-
-        let mut lock = self.db.inner.freelist.lock()?;
-        *lock = freelist.inner.clone();
-        Ok(())
     }
 }
 
-impl<'tx, Lock: TxL> Drop for TxInner<'tx, Lock> {
+impl<'tx, Lock: TxLock> Drop for TxInner<'tx, Lock> {
     fn drop(&mut self) {
         if !self.lock.writeable() {
             let mut open_txs = self.db.inner.open_ro_txs.lock().unwrap();
